@@ -21,9 +21,9 @@ void InitRoutingTbl(struct pkt_INIT_RESPONSE *InitResponse, int myID)
 
     for (neighborIterator = 0; neighborIterator < InitResponse->no_nbr; neighborIterator++)
     {
-        routingTable[neighborIterator].dest_id = InitResponse->nbrcost[neighborIterator].nbr;
-        routingTable[neighborIterator].next_hop = InitResponse->nbrcost[neighborIterator].nbr;
-        routingTable[neighborIterator].cost = InitResponse->nbrcost[neighborIterator].cost;
+        routingTable[neighborIterator + 1].dest_id = InitResponse->nbrcost[neighborIterator].nbr;
+        routingTable[neighborIterator + 1].next_hop = InitResponse->nbrcost[neighborIterator].nbr;
+        routingTable[neighborIterator + 1].cost = InitResponse->nbrcost[neighborIterator].cost;
         NumRoutes += 1;
     }
 }
@@ -109,9 +109,8 @@ void PrintRoutes(FILE *Logfile, int myID)
         {
             if (routingTable[routingTableIterator].dest_id == maxRouterCounter)
             {
-                fprintf(Logfile, "R%d -> R%d: R%d, %d", myID, maxRouterCounter,
+                fprintf(Logfile, "R%d -> R%d: R%d, %d\n", myID, maxRouterCounter,
                         routingTable[routingTableIterator].next_hop, routingTable[routingTableIterator].cost);
-                break;
             }
         }
     }
