@@ -114,6 +114,7 @@ void PrintRoutes(FILE *Logfile, int myID)
             }
         }
     }
+    fflush(Logfile);
 }
 
 void UninstallRoutesOnNbrDeath(int DeadNbr)

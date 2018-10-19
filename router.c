@@ -1,9 +1,47 @@
 #include "ne.h"
 #include "router.h"
-#include <sys/time.h>
+#include <sys/timerfd.h>
+#include <stdbool.h>
 
+// Struct that stores neighbor node data
+typedef struct
+{
+    unsigned int no_nbr;
+    unsigned int nbr_id[MAX_ROUTERS];
+    unsigned int nbr_cost[MAX_ROUTERS];
+} nbr_data;
+
+//-------------------------------------- FUNCTION DECLARATIONS---------------------*/
+
+/* Binds router socket to listen for incoming UDP Connections and send UDP Packets */
 int listenfd(int serverPort);
-int initiliazeRouter(int recvfd, int routerID, struct sockaddr_in *neClient);
+/* Send the initial request and the parses the initial response */
+int initiliazeRouter(int recvfd, int routerID, struct sockaddr_in *neClient, nbr_data *nbrData);
+/* The heart of the program that does all function such as update, converge, timeout handling */
+void enableRouter(int recvfd, int routerID, FILE *configfd, nbr_data nbrData, struct sockaddr_in neClient);
+/* ---------------------- ENABLEROUTER HELPER FUNCTIONS --------------------------*/
+/* Initializes a specific type of timer */
+/*
+type = 1 --> update timer
+type = 2 --> converge timer
+*/
+int initializeTimer(struct itimerspec *genericTimer, int type);
+/* Reset a specific type of timer */
+/*
+type = 1 --> update timer (reset to UPDATE_INTERVAL)
+type = 2 --> converge timer (reset to CONVERGE_TIMEOUT)
+*/
+void resetTimer(struct itimerspec *genericTimer, int type, int genericfd);
+/* Parses all incoming routing table packets and upates the routing table */
+void parseUpdates(struct pkt_RT_UPDATE updatePktRcvd, int recvfd, nbr_data nbrData,
+                  int routerID, FILE *configfd, int convergefd, bool converged, struct itimerspec *convergeTimer);
+/* Converts the routing table to a packet and sends it to other routers */
+void sendUpdates(struct pkt_RT_UPDATE updatePktToSend, int recvfd, int updatefd, struct sockaddr_in neClient,
+                 struct itimerspec *updateTimer, int routerID, nbr_data nbrData);
+/* Converges the tables */
+bool convergeTable(bool converged, FILE *configfd, struct itimerspec *convergeTimer, int convergefd);
+
+/*------------------------------ START OF THE PROGRAM ---------------------------*/
 
 int main(int argc, char **argv)
 {
@@ -60,7 +98,8 @@ int main(int argc, char **argv)
     networkEmulatorClient.sin_port = htons((unsigned short)udpPort);
 
     // Send INIT_REQUEST and get parse INIT_RESPONSE and initialize the routingTable
-    int initialize = initiliazeRouter(recvfd, routerID, &networkEmulatorClient);
+    nbr_data nbrData;
+    int initialize = initiliazeRouter(recvfd, routerID, &networkEmulatorClient, &nbrData);
     if (initialize < 0)
     {
         printf("Failed initial correspondance with the network\n");
@@ -69,11 +108,12 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // writing the initialized values into the logfile
+    // Writing the initialized values into the logfile
     PrintRoutes(configfd, routerID);
 
     // Use timerfd style coding to update routing table information
     // https://www.programering.com/a/MDMzAjMwATc.html (Used for understanding how timerfd programming works)
+    enableRouter(recvfd, routerID, configfd, nbrData, networkEmulatorClient);
 
     // Closing file read operations on router closing
     fclose(configfd);
@@ -107,7 +147,7 @@ int listenfd(int serverPort)
 }
 
 // Initializes the router and routing table with the appropriate values
-int initiliazeRouter(int recvfd, int routerID, struct sockaddr_in *neClient)
+int initiliazeRouter(int recvfd, int routerID, struct sockaddr_in *neClient, nbr_data *nbrData)
 {
     struct pkt_INIT_REQUEST initialRequest;
     initialRequest.router_id = htonl(routerID);
@@ -127,5 +167,169 @@ int initiliazeRouter(int recvfd, int routerID, struct sockaddr_in *neClient)
     }
     ntoh_pkt_INIT_RESPONSE(&initialResponse);
     InitRoutingTbl(&initialResponse, routerID);
+
+    // Storing all the neighbor information from the intial reponse
+    nbrData->no_nbr = initialResponse.no_nbr;
+    int i;
+    for (i = 0; i < nbrData->no_nbr; i++)
+    {
+        nbrData->nbr_id[i] = initialResponse.nbrcost[i].nbr;
+        nbrData->nbr_cost[i] = initialResponse.nbrcost[i].cost;
+    }
     return EXIT_SUCCESS;
+}
+
+// Implements the specific functionality of the router
+void enableRouter(int recvfd, int routerID, FILE *configfd, nbr_data nbrData, struct sockaddr_in neClient)
+{
+    struct pkt_RT_UPDATE updatePktToSend;
+    struct pkt_RT_UPDATE updatePktRcvd;
+
+    fd_set rdfs;
+
+    // update timer file descriptor and intializations
+    struct itimerspec updateTimer;
+    int updatefd = initializeTimer(&updateTimer, 1);
+
+    // converge time file descriptor and initializations
+    bool converged = false;
+    struct itimerspec convergeTimer;
+    int convergefd = initializeTimer(&convergeTimer, 2);
+
+    while (true)
+    {
+        FD_ZERO(&rdfs);
+        FD_SET(recvfd, &rdfs);
+        FD_SET(updatefd, &rdfs);
+        FD_SET(convergefd, &rdfs);
+        int selectfd = (convergefd > updatefd) ? convergefd : updatefd;
+        if (select(selectfd + 1, &rdfs, NULL, NULL, NULL) == -1)
+        {
+            printf("Select failed with errno: %d\n", errno);
+            exit(EXIT_FAILURE);
+        }
+
+        // Receive and parse updates from other routers
+        if (FD_ISSET(recvfd, &rdfs))
+        {
+            parseUpdates(updatePktRcvd, recvfd, nbrData, routerID,
+                         configfd, convergefd, converged, &convergeTimer);
+        }
+
+        // Send updates to other routers
+        if (FD_ISSET(updatefd, &rdfs))
+        {
+            sendUpdates(updatePktToSend, recvfd, updatefd, neClient,
+                        &updateTimer, routerID, nbrData);
+        }
+
+        // Routing table converged
+        if (FD_ISSET(convergefd, &rdfs))
+        {
+            converged = convergeTable(converged, configfd, &convergeTimer, convergefd);
+        }
+    }
+}
+
+//------------------------- ENABLE ROUTER BREAKDOWN ------------------------
+int initializeTimer(struct itimerspec *genericTimer, int type)
+{
+    if (type == 1)
+        genericTimer->it_value.tv_sec = UPDATE_INTERVAL;
+    else if (type == 2)
+        genericTimer->it_value.tv_sec = CONVERGE_TIMEOUT;
+    genericTimer->it_value.tv_nsec = 0;
+    genericTimer->it_interval.tv_sec = 0;
+    genericTimer->it_interval.tv_nsec = 0;
+    int genericfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    timerfd_settime(genericfd, 0, genericTimer, NULL);
+    return genericfd;
+}
+
+void resetTimer(struct itimerspec *genericTimer, int type, int genericfd)
+{
+    if (type == 1)
+        genericTimer->it_value.tv_sec = UPDATE_INTERVAL;
+    else if (type == 2)
+        genericTimer->it_value.tv_sec = CONVERGE_TIMEOUT;
+    genericTimer->it_value.tv_nsec = 0;
+    timerfd_settime(genericfd, 0, genericTimer, NULL);
+}
+
+void parseUpdates(struct pkt_RT_UPDATE updatePktRcvd, int recvfd, nbr_data nbrData,
+                  int routerID, FILE *configfd, int convergefd, bool converged, struct itimerspec *convergeTimer)
+{
+    bzero((char *)&updatePktRcvd, sizeof(updatePktRcvd));
+    // Receive the update packt from other routers
+    if (recvfrom(recvfd, (struct pkt_RT_UPDATE *)&updatePktRcvd,
+                 sizeof(updatePktRcvd), 0, NULL, NULL) < 0)
+    {
+        printf("recvfrom failed with errno: %d", errno);
+        exit(EXIT_FAILURE);
+    }
+
+    ntoh_pkt_RT_UPDATE(&updatePktRcvd);
+    int costToNbr = -1;
+
+    // Get the cost to the neighbor the packet came from
+    for (int i = 0; i < nbrData.no_nbr; i++)
+    {
+        if (updatePktRcvd.sender_id == nbrData.nbr_id[i])
+        {
+            costToNbr = nbrData.nbr_cost[i];
+            break;
+        }
+    }
+
+    // Update the routing table
+    int updatedTable = UpdateRoutes(&updatePktRcvd, costToNbr, routerID);
+
+    // If the routing table updated, rest the converge count down timer and
+    // the converged flag
+    if (updatedTable)
+    {
+        PrintRoutes(configfd, routerID);
+        resetTimer(convergeTimer, 2, convergefd);
+        converged = false;
+    }
+}
+
+void sendUpdates(struct pkt_RT_UPDATE updatePktToSend, int recvfd, int updatefd, struct sockaddr_in neClient,
+                 struct itimerspec *updateTimer, int routerID, nbr_data nbrData)
+{
+    bzero((char *)&updatePktToSend, sizeof(updatePktToSend));
+    ConvertTabletoPkt(&updatePktToSend, routerID);
+    int i;
+    for (i = 0; i < nbrData.no_nbr; i++)
+    {
+        printf("PRAVEEN: sending update to neighbor: %d\n", nbrData.nbr_id[i]);
+        updatePktToSend.dest_id = nbrData.nbr_id[i];
+        hton_pkt_RT_UPDATE(&updatePktToSend);
+        if (sendto(recvfd, (struct pkt_RT_UPDATE *)&updatePktToSend,
+                   sizeof(updatePktToSend), 0, (struct sockaddr *)&neClient,
+                   sizeof(neClient)) < 0)
+        {
+            printf("Failed to send data to other routers\n");
+            exit(EXIT_FAILURE);
+        }
+        ntoh_pkt_RT_UPDATE(&updatePktToSend);
+    }
+
+    // Reset the update interval
+    resetTimer(updateTimer, 1, updatefd);
+}
+
+bool convergeTable(bool converged, FILE *configfd, struct itimerspec *convergeTimer, int convergefd)
+{
+    // Print converged at the end of the file
+    if (!converged)
+    {
+        fprintf(configfd, "Converged");
+        fflush(configfd);
+        converged = true;
+    }
+
+    // Reset converge timeout
+    resetTimer(convergeTimer, 2, convergefd);
+    return converged;
 }
