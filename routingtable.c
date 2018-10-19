@@ -44,6 +44,7 @@ int UpdateRoutes(struct pkt_RT_UPDATE *RecvdUpdatePacket, int costToNbr, int myI
         {
             distance = INFINITY;
         }
+        notInTable = true;
         // Make changed to the required routing table entires
         for (j = 0; j < NumRoutes; j++)
         {
@@ -70,7 +71,6 @@ int UpdateRoutes(struct pkt_RT_UPDATE *RecvdUpdatePacket, int costToNbr, int myI
                 }
             }
         }
-
         // If update dest_id is not in the table add the data to the table
         if (notInTable)
         {
@@ -102,7 +102,7 @@ void PrintRoutes(FILE *Logfile, int myID)
     int maxRouterCounter = 0;
     int routingTableIterator = 0;
     // Print to file
-    fprintf(Logfile, "Routing Table:\n");
+    fprintf(Logfile, "\nRouting Table:\n");
     for (maxRouterCounter = 0; maxRouterCounter < MAX_ROUTERS; maxRouterCounter++)
     {
         for (routingTableIterator = 0; routingTableIterator < NumRoutes; routingTableIterator++)

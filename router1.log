@@ -1,5 +1,18 @@
+
 Routing Table:
 R1 -> R0: R0, 4
 R1 -> R1: R1, 0
 R1 -> R2: R2, 1
-Converged
+
+Routing Table:
+R1 -> R0: R0, 4
+R1 -> R1: R1, 0
+R1 -> R2: R2, 1
+R1 -> R3: R0, 60
+
+Routing Table:
+R1 -> R0: R0, 4
+R1 -> R1: R1, 0
+R1 -> R2: R2, 1
+R1 -> R3: R2, 7
+5:Converged
